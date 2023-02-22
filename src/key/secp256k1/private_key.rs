@@ -147,13 +147,11 @@ impl Key {
         let h160_addr = pubkey.to_h160();
 
         let mut addresses = HashMap::new();
-        let x_address = pubkey.to_hrp_address(network_id, "X")?;
-        let p_address = pubkey.to_hrp_address(network_id, "P")?;
         addresses.insert(
             network_id,
             secp256k1::ChainAddresses {
-                x_address,
-                p_address,
+                x: pubkey.to_hrp_address(network_id, "X")?,
+                p: pubkey.to_hrp_address(network_id, "P")?,
             },
         );
 
@@ -295,7 +293,7 @@ fn test_private_key() {
         .is_test(true)
         .try_init();
 
-    let msg: Vec<u8> = random_manager::bytes(100).unwrap();
+    let msg: Vec<u8> = random_manager::secure_bytes(100).unwrap();
     let hashed = hash::sha256(&msg);
 
     let pk1 = Key::generate().unwrap();

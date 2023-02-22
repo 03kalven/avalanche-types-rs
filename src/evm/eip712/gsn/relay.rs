@@ -6,12 +6,18 @@ use std::{
     str::FromStr,
 };
 
+use ethers::prelude::Eip1559TransactionRequest;
 use ethers_core::types::{
-    transaction::eip712::{Eip712, TypedData},
+    transaction::{
+        eip2718::TypedTransaction,
+        eip712::{Eip712, TypedData},
+    },
     RecoveryMessage, Signature, H160, H256, U256,
 };
+use ethers_providers::{Http, Middleware, Provider};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
+use tokio::time::{sleep, Duration, Instant};
 use zerocopy::AsBytes;
 
 impl super::Tx {
@@ -31,6 +37,94 @@ impl super::Tx {
         eth_signer: impl ethers_signers::Signer + Clone,
     ) -> io::Result<Request> {
         Request::sign_to_request(self, eth_signer).await
+    }
+
+    /// "sign_to_request" but with estimated gas via RPC endpoints.
+    pub async fn sign_to_request_with_estimated_gas(
+        &mut self,
+        eth_signer: impl ethers_signers::Signer + Clone,
+        chain_rpc_provider: Provider<Http>,
+    ) -> io::Result<Request> {
+        // as if a user sends EIP-1559 to the recipient contract
+        let eip1559_tx = Eip1559TransactionRequest::new()
+            .chain_id(self.domain_chain_id.as_u64())
+            .from(self.from)
+            .to(self.to)
+            .gas(self.gas)
+            .data(self.data.clone());
+        let typed_tx: TypedTransaction = eip1559_tx.into();
+        log::info!(
+            "estimating gas for typed tx {}",
+            serde_json::to_string(&typed_tx).unwrap()
+        );
+
+        // this can fail with 'gas required exceeds allowance'
+        // when the specified gas cap is too low
+        let estimated_gas = chain_rpc_provider
+            .estimate_gas(&typed_tx, None)
+            .await
+            .map_err(|e| Error::new(ErrorKind::Other, format!("failed estimate_gas '{}'", e)))?;
+        log::info!("estimated gas {estimated_gas} -- now signing again with updated gas");
+
+        self.gas = estimated_gas;
+        Request::sign_to_request(&self, eth_signer).await
+    }
+
+    /// "sign_to_request" but with estimated gas via RPC endpoints.
+    pub async fn sign_to_request_with_estimated_gas_with_retries(
+        &mut self,
+        eth_signer: impl ethers_signers::Signer + Clone,
+        chain_rpc_provider: Provider<Http>,
+        retry_timeout: Duration,
+        retry_interval: Duration,
+        retry_increment_gas: U256,
+    ) -> io::Result<Request> {
+        log::info!(
+            "sign with retries estimated gas, retry timeout {:?}, retry interval {:?}, retry increment gas {retry_increment_gas}",
+            retry_timeout,
+            retry_interval,
+        );
+
+        let start = Instant::now();
+        if self.gas.is_zero() {
+            self.gas = U256::from(21000);
+        }
+        let mut retries = 0;
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed.gt(&retry_timeout) {
+                break;
+            }
+            retries = retries + 1;
+
+            match Self::sign_to_request_with_estimated_gas(
+                self,
+                eth_signer.clone(),
+                chain_rpc_provider.clone(),
+            )
+            .await
+            {
+                Ok(req) => return Ok(req),
+                Err(e) => {
+                    log::warn!(
+                        "[retries {}] failed to estimate gas {} with gas {} (incrementing, elapsed {:?})",
+                        retries,
+                        e,
+                        self.gas,
+                        elapsed
+                    );
+                    if let Some(added_gas) = self.gas.checked_add(retry_increment_gas) {
+                        self.gas = added_gas;
+                    } else {
+                        return Err(Error::new(ErrorKind::Other, "gas overflow U256"));
+                    }
+
+                    sleep(retry_interval).await;
+                    continue;
+                }
+            }
+        }
+        return Err(Error::new(ErrorKind::Other, "failed estimate_gas in time"));
     }
 }
 
@@ -350,7 +444,7 @@ fn test_build_relay_transaction_request() {
         constant: None,
         state_mutability: StateMutability::NonPayable,
     };
-    let arg_tokens = vec![Token::String(random_manager::string(10))];
+    let arg_tokens = vec![Token::String(random_manager::secure_string(10))];
     let calldata = crate::evm::abi::encode_calldata(func, &arg_tokens).unwrap();
     log::info!("calldata: 0x{}", hex::encode(calldata.clone()));
 
@@ -360,11 +454,11 @@ fn test_build_relay_transaction_request() {
         };
     }
 
-    let domain_name = random_manager::string(20);
+    let domain_name = random_manager::secure_string(20);
     let domain_version = format!("{}", random_manager::u16());
 
-    let my_type = random_manager::string(20);
-    let my_suffix_data = random_manager::string(20);
+    let my_type = random_manager::secure_string(20);
+    let my_suffix_data = random_manager::secure_string(20);
 
     let tx = super::Tx::new()
         .domain_name(domain_name)

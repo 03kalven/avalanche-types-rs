@@ -40,44 +40,40 @@ impl Cmk {
     pub async fn create(
         kms_manager: kms::Manager,
         tags: HashMap<String, String>,
-        retry_timeout: Duration,
-        retry_interval: Duration,
     ) -> io::Result<Self> {
         let cmk = kms_manager
             .create_key(KeySpec::EccSecgP256K1, KeyUsageType::SignVerify, Some(tags))
             .await
             .map_err(|e| Error::new(ErrorKind::Other, format!("failed kms.create_key {}", e)))?;
 
-        Self::from_arn(kms_manager, &cmk.arn, retry_timeout, retry_interval).await
+        Self::from_arn(kms_manager, &cmk.arn).await
     }
 
     /// Loads the Cmk from its Arn or Id.
-    pub async fn from_arn(
-        kms_manager: kms::Manager,
-        arn: &str,
-        retry_timeout: Duration,
-        retry_interval: Duration,
-    ) -> io::Result<Self> {
-        let desc = kms_manager
-            .client()
-            .describe_key()
-            .key_id(arn)
-            .send()
-            .await
-            .map_err(|e| Error::new(ErrorKind::Other, format!("failed kms.describe_key {}", e)))?;
-        let id = desc.key_metadata().unwrap().key_id().unwrap().to_string();
+    pub async fn from_arn(kms_manager: kms::Manager, arn: &str) -> io::Result<Self> {
+        let (id, _desc) = kms_manager.describe_key(arn).await.map_err(|e| {
+            Error::new(
+                ErrorKind::Other,
+                format!(
+                    "failed kms.describe_key {} (retryable {})",
+                    e.message(),
+                    e.is_retryable()
+                ),
+            )
+        })?;
         log::info!("described key Id '{id}' from '{arn}'");
 
         // derives the public key from its private key
-        let pubkey = kms_manager
-            .client()
-            .get_public_key()
-            .key_id(arn) // or use Cmk Id
-            .send()
-            .await
-            .map_err(|e| {
-                Error::new(ErrorKind::Other, format!("failed kms.get_public_key {}", e))
-            })?;
+        let pubkey = kms_manager.get_public_key(arn).await.map_err(|e| {
+            Error::new(
+                ErrorKind::Other,
+                format!(
+                    "failed kms.get_public_key {} (retryable {})",
+                    e.message(),
+                    e.is_retryable()
+                ),
+            )
+        })?;
 
         if let Some(blob) = pubkey.public_key() {
             // same as "key::secp256k1::public_key::Key::from_public_key_der(blob.as_ref())"
@@ -92,24 +88,13 @@ impl Cmk {
                 public_key.to_eth_address(),
             );
 
-            let retry_timeout = if retry_timeout.is_zero() {
-                Duration::from_secs(90)
-            } else {
-                retry_timeout
-            };
-            let retry_interval = if retry_interval.is_zero() {
-                Duration::from_secs(10)
-            } else {
-                retry_interval
-            };
-
             return Ok(Self {
                 kms_manager,
                 public_key,
                 id,
                 arn: arn.to_string(),
-                retry_timeout,
-                retry_interval,
+                retry_timeout: Duration::from_secs(90),
+                retry_interval: Duration::from_secs(10),
             });
         }
 
@@ -135,13 +120,11 @@ impl Cmk {
         let h160_addr = self.public_key.to_h160();
 
         let mut addresses = HashMap::new();
-        let x_address = self.public_key.to_hrp_address(network_id, "X")?;
-        let p_address = self.public_key.to_hrp_address(network_id, "P")?;
         addresses.insert(
             network_id,
             key::secp256k1::ChainAddresses {
-                x_address,
-                p_address,
+                x: self.public_key.to_hrp_address(network_id, "X")?,
+                p: self.public_key.to_hrp_address(network_id, "P")?,
             },
         );
 
