@@ -39,6 +39,7 @@ sha3 = "0.10.6" # https://github.com/RustCrypto/hashes
 spki = "0.6.0"
 thiserror = "1.0.38"
 zerocopy = "0.6.1"
+ic-stable-memory = { git = "https://github.com/seniorjoinu/ic-stable-memory.git", branch = "fix/use-stable-rust"}
 
 # [OPTIONAL] for "libsecp256k1"
 secp256k1 = { version = "0.26.0", features = ["global-context", "rand-std", "recovery"], optional = true } # https://crates.io/crates/secp256k1
